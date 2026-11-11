@@ -1,0 +1,6 @@
+library/pdfs/*.pdf
+**/bin/
+**/obj/
+.vs/
+Nelkhael/App_Data/
+*.user
