@@ -134,37 +134,80 @@ public sealed class PdfLibraryStore
         await transaction.CommitAsync(cancellationToken);
     }
 
+    public async Task RemoveDocumentAsync(string path, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = connection.BeginTransaction();
+
+        await using (var deleteChunks = connection.CreateCommand())
+        {
+            deleteChunks.Transaction = transaction;
+            deleteChunks.CommandText = "DELETE FROM Chunks WHERE DocumentPath = $path;";
+            deleteChunks.Parameters.AddWithValue("$path", path);
+            await deleteChunks.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var deleteDocument = connection.CreateCommand())
+        {
+            deleteDocument.Transaction = transaction;
+            deleteDocument.CommandText = "DELETE FROM Documents WHERE Path = $path;";
+            deleteDocument.Parameters.AddWithValue("$path", path);
+            await deleteDocument.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<IReadOnlyList<IndexedChunk>> GetChunksAsync(CancellationToken cancellationToken)
     {
         var chunks = new List<IndexedChunk>();
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT Id, Source, PageNumber, Content, Embedding FROM Chunks;";
+        command.CommandText = "SELECT Id, DocumentPath, Source, PageNumber, Content, Embedding FROM Chunks;";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
             chunks.Add(new IndexedChunk(
                 reader.GetString(0),
-                reader.GetString(1),
-                reader.GetInt32(2),
-                reader.GetString(3),
-                FromBytes((byte[])reader[4])));
+                reader.GetString(2),
+                reader.GetInt32(3),
+                reader.GetString(4),
+                FromBytes((byte[])reader[5]),
+                GetSourceType(reader.GetString(1))));
         }
 
         return chunks;
     }
 
-    public async Task<(int Documents, int Chunks)> GetCountsAsync(CancellationToken cancellationToken)
+    public async Task<(int Documents, int Chunks, int OfficialDocuments, int UnofficialDocuments)> GetCountsAsync(
+        CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken);
+        var officialDocuments = 0;
+        var unofficialDocuments = 0;
+
+        await using (var documents = connection.CreateCommand())
+        {
+            documents.CommandText = "SELECT Path FROM Documents;";
+            await using var reader = await documents.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (GetSourceType(reader.GetString(0)) == "Unofficial")
+                {
+                    unofficialDocuments++;
+                }
+                else
+                {
+                    officialDocuments++;
+                }
+            }
+        }
+
         await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT (SELECT COUNT(*) FROM Documents), (SELECT COUNT(*) FROM Chunks);
-            """;
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        await reader.ReadAsync(cancellationToken);
-        return (reader.GetInt32(0), reader.GetInt32(1));
+        command.CommandText = "SELECT COUNT(*) FROM Chunks;";
+        var chunks = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+        return (officialDocuments + unofficialDocuments, chunks, officialDocuments, unofficialDocuments);
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
@@ -192,6 +235,20 @@ public sealed class PdfLibraryStore
         Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
         return values;
     }
+
+    private static string GetSourceType(string documentPath) =>
+        string.Equals(
+            Path.GetFileName(Path.GetDirectoryName(documentPath)),
+            "Unofficial",
+            StringComparison.OrdinalIgnoreCase)
+            ? "Unofficial"
+            : "Official";
 }
 
-public sealed record IndexedChunk(string Id, string Source, int PageNumber, string Content, float[] Embedding);
+public sealed record IndexedChunk(
+    string Id,
+    string Source,
+    int PageNumber,
+    string Content,
+    float[] Embedding,
+    string SourceType);

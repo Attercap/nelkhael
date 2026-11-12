@@ -43,7 +43,7 @@
     <header>
       <div class="eyebrow">Angel of Learning</div>
       <h1>Nelkhael</h1>
-      <div class="subtitle">A private, local rules companion for In Nomine. Ask a question and get a concise answer grounded in your indexed books.</div>
+      <div class="subtitle">A private, local rules companion for In Nomine. Ask a question and get a concise answer grounded in your indexed official and unofficial books.</div>
     </header>
     <section class="panel" aria-label="Rules reference">
       <div class="toolbar">
@@ -74,8 +74,8 @@
         const response = await fetch("/api/status");
         const status = await response.json();
         statusElement.textContent = status.directoryExists
-          ? `${status.documents} books indexed · ${status.chunks} passages`
-          : "PDF directory not found; update LibraryPath in appsettings.json.";
+          ? `Official: ${status.officialDocuments} books · Unofficial: ${status.unofficialDocuments} books · ${status.chunks} passages`
+          : "Official/Unofficial PDF directories not found; update LibraryPath in appsettings.json.";
       } catch {
         statusElement.textContent = "Could not read library status.";
       }
@@ -116,7 +116,7 @@
         answerElement.textContent = result.answer;
         for (const source of result.sources) {
           const item = document.createElement("li");
-          item.textContent = `${source.book}, PDF p. ${source.page}`;
+          item.textContent = `${source.sourceType}: ${source.book}, PDF p. ${source.page}`;
           sourcesElement.append(item);
         }
         noticeElement.textContent = "";

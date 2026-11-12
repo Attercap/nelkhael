@@ -1,6 +1,6 @@
 # Nelkhael
 
-Nelkhael is a local-first .NET 10 web app for asking questions about the In Nomine PDFs in `library/pdfs`. It extracts text from PDFs, creates local embeddings with Ollama, stores the index in SQLite, and returns concise paraphrased answers with book and page citations.
+Nelkhael is a local-first .NET 10 web app for asking questions about the In Nomine PDFs in `library/Official` and `library/Unofficial`. It extracts text from PDFs, creates local embeddings with Ollama, stores the index in SQLite, and returns concise paraphrased answers with book, source type, and page citations.
 
 In theory, this can work for any RPG ruleset, but it's advised to not combine multiple tabletop rpgs under a single application in this version.
 
@@ -24,11 +24,11 @@ ollama pull qwen2.5:7b
 From the repository root:
 
 ```powershell
-New-Item -ItemType Directory -Force .\library\pdfs
+New-Item -ItemType Directory -Force .\library\Official, .\library\Unofficial
 dotnet run --project .\Nelkhael\Nelkhael.csproj
 ```
 
-Before indexing, add your own searchable RPG rulebook PDFs to `library\pdfs`. That folder is ignored by Git, so each user must create and populate it locally; Nelkhael does not include books. The default `LibraryPath` points to this folder.
+Before indexing, add searchable RPG rulebook PDFs directly to `library\Official` or `library\Unofficial`. The folders are ignored by Git for PDFs, so each user must populate them locally; Nelkhael does not include books. PDFs that were previously in `library\pdfs` belong in `library\Official`. The default `LibraryPath` points to the `library` folder and indexes PDFs from both source folders.
 
 Open <http://localhost:5080>, then select **Index PDF library**. Indexing skips files that have not changed. The SQLite database is created at `Nelkhael\App_Data\nelkhael.db`.
 
@@ -45,7 +45,7 @@ The indexer checks Ollama and the embedding model before reading PDFs and report
 
 Edit `Nelkhael\appsettings.json` or use standard .NET configuration overrides:
 
-- `LibraryPath`: PDF folder; relative paths resolve from the project directory.
+- `LibraryPath`: parent folder containing `Official` and `Unofficial`; relative paths resolve from the project directory.
 - `DataPath`: SQLite database path; relative paths resolve from the project directory.
 - `Ollama:Endpoint`, `Ollama:EmbeddingModel`, and `Ollama:ChatModel`: local Ollama settings.
 
@@ -55,5 +55,5 @@ Nelkhael is designed to explain rules in its own words and cite source pages; us
 
 ## Upcoming Enhancements
 
-- Allow for reading text-based files (including php and html) for custom/3rd party rules
-- Read public html pages for custom/3rd party rules
+- Allow for reading text-based files (including php and html)
+- Read and store from public html pages

@@ -16,6 +16,7 @@ public sealed class LibraryIndexer(
     private const int ChunkOverlap = 180;
     private const int EmbeddingBatchSize = 24;
     private const int AnswerChunkCount = 6;
+    private static readonly string[] SourceTypes = ["Official", "Unofficial"];
     private readonly SemaphoreSlim _indexLock = new(1, 1);
     private readonly string _libraryPath = ResolveLibraryPath(configuration, environment);
 
@@ -30,7 +31,17 @@ public sealed class LibraryIndexer(
         {
             if (!Directory.Exists(_libraryPath))
             {
-                throw new DirectoryNotFoundException($"PDF library directory was not found: {_libraryPath}");
+                throw new DirectoryNotFoundException($"Library directory was not found: {_libraryPath}");
+            }
+
+            var sourceDirectories = SourceTypes
+                .Select(sourceType => (SourceType: sourceType, Path: Path.Combine(_libraryPath, sourceType)))
+                .ToArray();
+            var missingDirectory = sourceDirectories.FirstOrDefault(directory => !Directory.Exists(directory.Path));
+            if (missingDirectory.Path is not null)
+            {
+                throw new DirectoryNotFoundException(
+                    $"{missingDirectory.SourceType} PDF directory was not found: {missingDirectory.Path}");
             }
 
             var ollamaIssue = await ollama.GetEmbeddingModelIssueAsync(cancellationToken);
@@ -42,22 +53,27 @@ public sealed class LibraryIndexer(
             var failures = new List<string>();
             var indexedFiles = 0;
             var skippedFiles = 0;
-            var pdfPaths = Directory.GetFiles(_libraryPath, "*.pdf", SearchOption.TopDirectoryOnly);
+            var pdfPaths = sourceDirectories
+                .SelectMany(directory => Directory.GetFiles(directory.Path, "*.pdf", SearchOption.TopDirectoryOnly)
+                    .Select(path => (Path: path, directory.SourceType)))
+                .ToArray();
 
-            foreach (var path in pdfPaths)
+            foreach (var (path, sourceType) in pdfPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var fileInfo = new FileInfo(path);
                 var lastWriteUtcTicks = fileInfo.LastWriteTimeUtc.Ticks;
+                var legacyPath = Path.Combine(_libraryPath, "pdfs", Path.GetFileName(path));
                 if (await store.IsCurrentAsync(path, lastWriteUtcTicks, fileInfo.Length, cancellationToken))
                 {
+                    await store.RemoveDocumentAsync(legacyPath, cancellationToken);
                     skippedFiles++;
                     continue;
                 }
 
                 try
                 {
-                    var chunks = ReadChunks(path);
+                    var chunks = ReadChunks(path, sourceType);
                     if (chunks.Count == 0)
                     {
                         throw new InvalidDataException("No searchable text was found. Scanned PDFs require OCR before indexing.");
@@ -79,6 +95,7 @@ public sealed class LibraryIndexer(
                         fileInfo.Length,
                         chunks,
                         cancellationToken);
+                    await store.RemoveDocumentAsync(legacyPath, cancellationToken);
                     indexedFiles++;
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
@@ -121,10 +138,10 @@ public sealed class LibraryIndexer(
         var context = string.Join(
             "\n\n",
             matches.Select(match =>
-                $"[Source: {match.Chunk.Source}, page {match.Chunk.PageNumber}]\n{match.Chunk.Content}"));
+                $"[{match.Chunk.SourceType} source: {match.Chunk.Source}, page {match.Chunk.PageNumber}]\n{match.Chunk.Content}"));
         var answer = await ollama.AnswerAsync(context, question, cancellationToken);
         var sources = matches
-            .Select(match => new SourceCitation(match.Chunk.Source, match.Chunk.PageNumber))
+            .Select(match => new SourceCitation(match.Chunk.Source, match.Chunk.PageNumber, match.Chunk.SourceType))
             .Distinct()
             .ToArray();
 
@@ -134,10 +151,19 @@ public sealed class LibraryIndexer(
     public async Task<LibraryStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
         var counts = await store.GetCountsAsync(cancellationToken);
-        return new LibraryStatus(_libraryPath, Directory.Exists(_libraryPath), _indexLock.CurrentCount == 0, counts.Documents, counts.Chunks);
+        var directoriesExist = Directory.Exists(_libraryPath)
+            && SourceTypes.All(sourceType => Directory.Exists(Path.Combine(_libraryPath, sourceType)));
+        return new LibraryStatus(
+            _libraryPath,
+            directoriesExist,
+            _indexLock.CurrentCount == 0,
+            counts.Documents,
+            counts.Chunks,
+            counts.OfficialDocuments,
+            counts.UnofficialDocuments);
     }
 
-    private static List<IndexedChunk> ReadChunks(string path)
+    private static List<IndexedChunk> ReadChunks(string path, string sourceType)
     {
         var chunks = new List<IndexedChunk>();
         using var document = PdfDocument.Open(path);
@@ -151,7 +177,7 @@ public sealed class LibraryIndexer(
             {
                 var identifier = $"{Path.GetFullPath(path)}|{page.Number}|{part++}";
                 var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identifier)));
-                chunks.Add(new IndexedChunk(id, source, page.Number, content, []));
+                chunks.Add(new IndexedChunk(id, source, page.Number, content, [], sourceType));
             }
         }
 
@@ -221,7 +247,7 @@ public sealed class LibraryIndexer(
 
     private static string ResolveLibraryPath(IConfiguration configuration, IWebHostEnvironment environment)
     {
-        var configuredPath = configuration["LibraryPath"] ?? "..\\library\\pdfs";
+        var configuredPath = configuration["LibraryPath"] ?? "..\\library";
         return Path.GetFullPath(Path.IsPathRooted(configuredPath)
             ? configuredPath
             : Path.Combine(environment.ContentRootPath, configuredPath));
@@ -229,6 +255,13 @@ public sealed class LibraryIndexer(
 }
 
 public sealed record IndexResult(bool IsRunning, int IndexedFiles, int SkippedFiles, IReadOnlyList<string> Failures);
-public sealed record LibraryStatus(string Path, bool DirectoryExists, bool IsIndexing, int Documents, int Chunks);
-public sealed record SourceCitation(string Book, int Page);
+public sealed record LibraryStatus(
+    string Path,
+    bool DirectoryExists,
+    bool IsIndexing,
+    int Documents,
+    int Chunks,
+    int OfficialDocuments,
+    int UnofficialDocuments);
+public sealed record SourceCitation(string Book, int Page, string SourceType);
 public sealed record AskResponse(string Answer, IReadOnlyList<SourceCitation> Sources);
