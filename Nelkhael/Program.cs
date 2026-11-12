@@ -26,6 +26,21 @@ app.MapPost("/api/index", async (LibraryIndexer indexer, CancellationToken cance
         : Results.Ok(result);
 });
 
+app.MapDelete("/api/index", async Task<IResult> (
+    LibraryIndexer indexer,
+    CancellationToken cancellationToken) =>
+{
+    var flushed = await indexer.FlushIndexAsync(cancellationToken);
+    return flushed
+        ? TypedResults.NoContent()
+        : TypedResults.Conflict();
+})
+    .WithName("FlushIndex")
+    .WithSummary("Flush the PDF index")
+    .WithDescription("Removes all indexed documents and passages from SQLite without deleting source PDFs. Returns 409 if indexing is in progress.")
+    .Produces(StatusCodes.Status204NoContent)
+    .Produces(StatusCodes.Status409Conflict);
+
 app.MapPost("/api/ask", async (AskRequest request, LibraryIndexer indexer, CancellationToken cancellationToken) =>
 {
     if (string.IsNullOrWhiteSpace(request.Question) || request.Question.Length > 500)

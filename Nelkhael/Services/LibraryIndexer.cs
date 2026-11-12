@@ -24,7 +24,7 @@ public sealed class LibraryIndexer(
     {
         if (!await _indexLock.WaitAsync(0, cancellationToken))
         {
-            return new IndexResult(true, 0, 0, []);
+            return new IndexResult(true, 0, 0, 0, []);
         }
 
         try
@@ -44,19 +44,21 @@ public sealed class LibraryIndexer(
                     $"{missingDirectory.SourceType} PDF directory was not found: {missingDirectory.Path}");
             }
 
+            var pdfPaths = sourceDirectories
+                .SelectMany(directory => Directory.GetFiles(directory.Path, "*.pdf", SearchOption.TopDirectoryOnly)
+                    .Select(path => (Path: path, directory.SourceType)))
+                .ToArray();
+            var removedFiles = await RemoveMissingDocumentsAsync(sourceDirectories, pdfPaths, cancellationToken);
+
             var ollamaIssue = await ollama.GetEmbeddingModelIssueAsync(cancellationToken);
             if (ollamaIssue is not null)
             {
-                return new IndexResult(false, 0, 0, [ollamaIssue]);
+                return new IndexResult(false, 0, 0, removedFiles, [ollamaIssue]);
             }
 
             var failures = new List<string>();
             var indexedFiles = 0;
             var skippedFiles = 0;
-            var pdfPaths = sourceDirectories
-                .SelectMany(directory => Directory.GetFiles(directory.Path, "*.pdf", SearchOption.TopDirectoryOnly)
-                    .Select(path => (Path: path, directory.SourceType)))
-                .ToArray();
 
             foreach (var (path, sourceType) in pdfPaths)
             {
@@ -105,12 +107,44 @@ public sealed class LibraryIndexer(
                 }
             }
 
-            return new IndexResult(false, indexedFiles, skippedFiles, failures);
+            return new IndexResult(false, indexedFiles, skippedFiles, removedFiles, failures);
         }
         finally
         {
             _indexLock.Release();
         }
+    }
+
+    private async Task<int> RemoveMissingDocumentsAsync(
+        (string SourceType, string Path)[] sourceDirectories,
+        (string Path, string SourceType)[] pdfPaths,
+        CancellationToken cancellationToken)
+    {
+        var pathComparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        var sourceDirectoryPaths = sourceDirectories
+            .Select(directory => Path.GetFullPath(directory.Path))
+            .ToHashSet(pathComparer);
+        var currentPdfPaths = pdfPaths
+            .Select(pdf => Path.GetFullPath(pdf.Path))
+            .ToHashSet(pathComparer);
+
+        var removedFiles = 0;
+        foreach (var indexedPath in await store.GetDocumentPathsAsync(cancellationToken))
+        {
+            var fullIndexedPath = Path.GetFullPath(indexedPath);
+            var parentDirectory = Path.GetDirectoryName(fullIndexedPath);
+            if (parentDirectory is not null
+                && sourceDirectoryPaths.Contains(parentDirectory)
+                && !currentPdfPaths.Contains(fullIndexedPath))
+            {
+                await store.RemoveDocumentAsync(indexedPath, cancellationToken);
+                removedFiles++;
+            }
+        }
+
+        return removedFiles;
     }
 
     public async Task<AskResponse?> AnswerAsync(string question, CancellationToken cancellationToken)
@@ -146,6 +180,24 @@ public sealed class LibraryIndexer(
             .ToArray();
 
         return new AskResponse(answer, sources);
+    }
+
+    public async Task<bool> FlushIndexAsync(CancellationToken cancellationToken)
+    {
+        if (!await _indexLock.WaitAsync(0, cancellationToken))
+        {
+            return false;
+        }
+
+        try
+        {
+            await store.ClearAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _indexLock.Release();
+        }
     }
 
     public async Task<LibraryStatus> GetStatusAsync(CancellationToken cancellationToken)
@@ -254,7 +306,7 @@ public sealed class LibraryIndexer(
     }
 }
 
-public sealed record IndexResult(bool IsRunning, int IndexedFiles, int SkippedFiles, IReadOnlyList<string> Failures);
+public sealed record IndexResult(bool IsRunning, int IndexedFiles, int SkippedFiles, int RemovedFiles, IReadOnlyList<string> Failures);
 public sealed record LibraryStatus(
     string Path,
     bool DirectoryExists,

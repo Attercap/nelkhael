@@ -69,6 +69,22 @@ public sealed class PdfLibraryStore
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken)) != 0;
     }
 
+    public async Task<IReadOnlyList<string>> GetDocumentPathsAsync(CancellationToken cancellationToken)
+    {
+        var paths = new List<string>();
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Path FROM Documents;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            paths.Add(reader.GetString(0));
+        }
+
+        return paths;
+    }
+
     public async Task ReplaceDocumentAsync(
         string path,
         long lastWriteUtcTicks,
@@ -155,6 +171,17 @@ public sealed class PdfLibraryStore
             await deleteDocument.ExecuteNonQueryAsync(cancellationToken);
         }
 
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task ClearAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = connection.BeginTransaction();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "DELETE FROM Chunks; DELETE FROM Documents;";
+        await command.ExecuteNonQueryAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
 

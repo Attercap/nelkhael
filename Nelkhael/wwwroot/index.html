@@ -22,9 +22,12 @@
     .subtitle { color: #bbc5dc; line-height: 1.65; max-width: 650px; }
     .panel { border: 1px solid #29344e; border-radius: 18px; background: #111827e8; padding: 22px; box-shadow: 0 20px 70px #02061766; }
     .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .toolbar-actions { display: flex; gap: 10px; }
     #status { color: #b7c1d9; font-size: .9rem; }
     button { border: 0; border-radius: 10px; padding: 11px 16px; background: #a5b4fc; color: #111827; cursor: pointer; font-weight: 700; }
     button:hover { background: #c7d2fe; }
+    button.danger { background: #7f1d1d; color: #fee2e2; }
+    button.danger:hover { background: #991b1b; }
     button:disabled { cursor: wait; opacity: .6; }
     label { display: block; margin: 16px 0 8px; font-size: .92rem; font-weight: 650; }
     textarea { display: block; width: 100%; min-height: 104px; resize: vertical; border: 1px solid #36435f; border-radius: 10px; padding: 13px; background: #0b1020; color: #eef2ff; font: inherit; line-height: 1.5; }
@@ -35,7 +38,7 @@
     #sources { margin: 14px 0 0; padding-left: 20px; color: #bbc5dc; line-height: 1.7; }
     #notice { min-height: 1.5em; margin-top: 12px; color: #fbbf24; font-size: .9rem; }
     .footnote { color: #8491ad; font-size: .82rem; line-height: 1.55; margin: 18px 2px 0; }
-    @media (max-width: 560px) { main { padding-top: 28px; } .panel { padding: 16px; } .toolbar { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 560px) { main { padding-top: 28px; } .panel { padding: 16px; } .toolbar { align-items: flex-start; flex-direction: column; } .toolbar-actions { flex-wrap: wrap; } }
   </style>
 </head>
 <body>
@@ -48,7 +51,10 @@
     <section class="panel" aria-label="Rules reference">
       <div class="toolbar">
         <div id="status" role="status">Checking library…</div>
-        <button id="index" type="button">Index PDF library</button>
+        <div class="toolbar-actions">
+          <button id="index" type="button">Index PDF library</button>
+          <button id="flush-index" class="danger" type="button">Flush Index</button>
+        </div>
       </div>
       <form id="question-form">
         <label for="question">What would you like to know?</label>
@@ -67,6 +73,7 @@
     const answerElement = document.querySelector("#answer");
     const sourcesElement = document.querySelector("#sources");
     const indexButton = document.querySelector("#index");
+    const flushIndexButton = document.querySelector("#flush-index");
     const askButton = document.querySelector("#ask");
 
     async function refreshStatus() {
@@ -83,19 +90,47 @@
 
     indexButton.addEventListener("click", async () => {
       indexButton.disabled = true;
+      flushIndexButton.disabled = true;
       noticeElement.textContent = "Indexing PDFs; first-time indexing may take a while…";
       try {
         const response = await fetch("/api/index", { method: "POST" });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.error ?? "Indexing failed.");
+        if (!response.ok && !result.isRunning) throw new Error(result.error ?? "Indexing failed.");
         noticeElement.textContent = result.isRunning
           ? "Indexing is already in progress."
-          : `Indexed ${result.indexedFiles} books; skipped ${result.skippedFiles} unchanged books.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
+          : `Indexed ${result.indexedFiles} books; skipped ${result.skippedFiles} unchanged books; removed ${result.removedFiles} missing books from the index.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
         await refreshStatus();
       } catch (error) {
         noticeElement.textContent = error.message;
       } finally {
         indexButton.disabled = false;
+        flushIndexButton.disabled = false;
+      }
+    });
+
+    flushIndexButton.addEventListener("click", async () => {
+      if (!window.confirm("Are you sure you want to flush the index? All indexed passages will be removed; your PDF files will not be deleted.")) {
+        return;
+      }
+
+      indexButton.disabled = true;
+      flushIndexButton.disabled = true;
+      noticeElement.textContent = "Flushing the PDF index…";
+      try {
+        const response = await fetch("/api/index", { method: "DELETE" });
+        if (response.status === 409) {
+          throw new Error("Cannot flush the index while indexing is in progress.");
+        }
+        if (!response.ok) throw new Error("Flushing the index failed.");
+        answerElement.textContent = "";
+        sourcesElement.replaceChildren();
+        noticeElement.textContent = "Index flushed. Your PDF files were not deleted.";
+        await refreshStatus();
+      } catch (error) {
+        noticeElement.textContent = error.message;
+      } finally {
+        indexButton.disabled = false;
+        flushIndexButton.disabled = false;
       }
     });
 
