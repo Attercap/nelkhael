@@ -36,8 +36,8 @@ app.MapDelete("/api/index", async Task<IResult> (
         : TypedResults.Conflict();
 })
     .WithName("FlushIndex")
-    .WithSummary("Flush the PDF index")
-    .WithDescription("Removes all indexed documents and passages from SQLite without deleting source PDFs. Returns 409 if indexing is in progress.")
+    .WithSummary("Flush the library index")
+    .WithDescription("Removes all indexed documents and passages from SQLite without deleting source files. Returns 409 if indexing is in progress.")
     .Produces(StatusCodes.Status204NoContent)
     .Produces(StatusCodes.Status409Conflict);
 
@@ -50,7 +50,7 @@ app.MapPost("/api/ask", async (AskRequest request, LibraryIndexer indexer, Cance
 
     var answer = await indexer.AnswerAsync(request.Question.Trim(), cancellationToken);
     return answer is null
-        ? Results.Conflict(new { error = "No indexed PDF content is available. Index the library first." })
+        ? Results.Conflict(new { error = "No indexed library content is available. Index the library first." })
         : Results.Ok(answer);
 });
 

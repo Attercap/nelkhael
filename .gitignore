@@ -1,5 +1,7 @@
-library/Official/*.pdf
-library/Unofficial/*.pdf
+/library/**
+!/library/**/
+!/library/**/.gitkeep
+!/library/.gitkeep
 **/bin/
 **/obj/
 .vs/

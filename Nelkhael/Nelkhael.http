@@ -1,6 +1,6 @@
 @baseUrl = http://localhost:5080
 
-### Flush all indexed documents and chunks; source PDFs remain unchanged
+### Flush all indexed documents and chunks; source files remain unchanged
 DELETE {{baseUrl}}/api/index
 
 ### Returns 409 Conflict if an indexing pass is currently running

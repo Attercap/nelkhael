@@ -1,5 +1,7 @@
 using System.Net;
+using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
@@ -119,6 +121,32 @@ public sealed class LibraryIndexerTests
     }
 
     [TestMethod]
+    public async Task IndexAsync_IndexesSupportedTextFilesAndIgnoresUnsupportedFiles()
+    {
+        var officialPath = Path.Combine(_libraryPath, "Official");
+        await File.WriteAllTextAsync(Path.Combine(officialPath, "rules.txt"), "A plain text rule.");
+        await File.WriteAllTextAsync(
+            Path.Combine(officialPath, "rules.html"),
+            "<html><head><style>.hidden{display:none}</style><script>hidden script</script></head><body><p>HTML &amp; text rule</p></body></html>");
+        await File.WriteAllTextAsync(Path.Combine(officialPath, "rules.json"), """{"name":"JSON rule","detail":"structured text"}""");
+        await File.WriteAllTextAsync(Path.Combine(officialPath, "rules.PHP"), "<?php echo 'PHP rule'; ?>");
+        await File.WriteAllTextAsync(Path.Combine(officialPath, "image.png"), "not indexed");
+
+        var result = await CreateIndexer(embeddingModelAvailable: true).IndexAsync(CancellationToken.None);
+
+        Assert.AreEqual(4, result.IndexedFiles);
+        Assert.IsEmpty(result.Failures);
+        var chunks = await _store.GetChunksAsync(CancellationToken.None);
+        Assert.HasCount(4, chunks);
+        Assert.Contains("plain text rule", chunks.Single(chunk => chunk.Source == "rules.txt").Content);
+        var html = chunks.Single(chunk => chunk.Source == "rules.html").Content;
+        Assert.Contains("HTML & text rule", html);
+        Assert.DoesNotContain("hidden", html);
+        Assert.Contains("JSON rule", chunks.Single(chunk => chunk.Source == "rules.json").Content);
+        Assert.Contains("PHP rule", chunks.Single(chunk => chunk.Source == "rules.PHP").Content);
+    }
+
+    [TestMethod]
     public async Task FlushIndexAsync_RemovesAllIndexedDocumentsAndChunksWithoutDeletingPdfs()
     {
         var pdfPath = Path.Combine(_libraryPath, "Official", "book.pdf");
@@ -185,17 +213,36 @@ public sealed class LibraryIndexerTests
 
     private sealed class OllamaHandler(bool embeddingModelAvailable) : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(
+        protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
-            var models = embeddingModelAvailable
-                ? """{"models":[{"name":"nomic-embed-text"}]}"""
-                : """{"models":[]}""";
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            if (request.RequestUri?.AbsolutePath == "/api/tags")
             {
-                Content = new StringContent(models, Encoding.UTF8, "application/json")
-            });
+                var models = embeddingModelAvailable
+                    ? """{"models":[{"name":"nomic-embed-text"}]}"""
+                    : """{"models":[]}""";
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(models, Encoding.UTF8, "application/json")
+                };
+            }
+
+            if (request.RequestUri?.AbsolutePath == "/api/embed")
+            {
+                await using var stream = await request.Content!.ReadAsStreamAsync(cancellationToken);
+                using var body = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+                var count = body.RootElement.GetProperty("input").GetArrayLength();
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        embeddings = Enumerable.Range(0, count).Select(_ => new[] { 0.1f, 0.2f }).ToArray()
+                    })
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
         }
     }
 }

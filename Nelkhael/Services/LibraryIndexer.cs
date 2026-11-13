@@ -1,3 +1,4 @@
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -17,6 +18,8 @@ public sealed class LibraryIndexer(
     private const int EmbeddingBatchSize = 24;
     private const int AnswerChunkCount = 6;
     private static readonly string[] SourceTypes = ["Official", "Unofficial"];
+    private static readonly HashSet<string> SupportedExtensions =
+        new([".pdf", ".txt", ".html", ".htm", ".json", ".php"], StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _indexLock = new(1, 1);
     private readonly string _libraryPath = ResolveLibraryPath(configuration, environment);
 
@@ -41,14 +44,15 @@ public sealed class LibraryIndexer(
             if (missingDirectory.Path is not null)
             {
                 throw new DirectoryNotFoundException(
-                    $"{missingDirectory.SourceType} PDF directory was not found: {missingDirectory.Path}");
+                    $"{missingDirectory.SourceType} library directory was not found: {missingDirectory.Path}");
             }
 
-            var pdfPaths = sourceDirectories
-                .SelectMany(directory => Directory.GetFiles(directory.Path, "*.pdf", SearchOption.TopDirectoryOnly)
+            var documentPaths = sourceDirectories
+                .SelectMany(directory => Directory.GetFiles(directory.Path, "*", SearchOption.TopDirectoryOnly)
+                    .Where(IsSupportedFile)
                     .Select(path => (Path: path, directory.SourceType)))
                 .ToArray();
-            var removedFiles = await RemoveMissingDocumentsAsync(sourceDirectories, pdfPaths, cancellationToken);
+            var removedFiles = await RemoveMissingDocumentsAsync(sourceDirectories, documentPaths, cancellationToken);
 
             var ollamaIssue = await ollama.GetEmbeddingModelIssueAsync(cancellationToken);
             if (ollamaIssue is not null)
@@ -60,7 +64,7 @@ public sealed class LibraryIndexer(
             var indexedFiles = 0;
             var skippedFiles = 0;
 
-            foreach (var (path, sourceType) in pdfPaths)
+            foreach (var (path, sourceType) in documentPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var fileInfo = new FileInfo(path);
@@ -68,7 +72,11 @@ public sealed class LibraryIndexer(
                 var legacyPath = Path.Combine(_libraryPath, "pdfs", Path.GetFileName(path));
                 if (await store.IsCurrentAsync(path, lastWriteUtcTicks, fileInfo.Length, cancellationToken))
                 {
-                    await store.RemoveDocumentAsync(legacyPath, cancellationToken);
+                    if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await store.RemoveDocumentAsync(legacyPath, cancellationToken);
+                    }
+
                     skippedFiles++;
                     continue;
                 }
@@ -78,7 +86,7 @@ public sealed class LibraryIndexer(
                     var chunks = ReadChunks(path, sourceType);
                     if (chunks.Count == 0)
                     {
-                        throw new InvalidDataException("No searchable text was found. Scanned PDFs require OCR before indexing.");
+                        throw new InvalidDataException("No searchable text was found.");
                     }
 
                     for (var offset = 0; offset < chunks.Count; offset += EmbeddingBatchSize)
@@ -97,12 +105,16 @@ public sealed class LibraryIndexer(
                         fileInfo.Length,
                         chunks,
                         cancellationToken);
-                    await store.RemoveDocumentAsync(legacyPath, cancellationToken);
+                    if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await store.RemoveDocumentAsync(legacyPath, cancellationToken);
+                    }
+
                     indexedFiles++;
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
-                    logger.LogError(exception, "Could not index PDF {PdfPath}", path);
+                    logger.LogError(exception, "Could not index document {DocumentPath}", path);
                     failures.Add($"{Path.GetFileName(path)}: {exception.Message}");
                 }
             }
@@ -117,7 +129,7 @@ public sealed class LibraryIndexer(
 
     private async Task<int> RemoveMissingDocumentsAsync(
         (string SourceType, string Path)[] sourceDirectories,
-        (string Path, string SourceType)[] pdfPaths,
+        (string Path, string SourceType)[] documentPaths,
         CancellationToken cancellationToken)
     {
         var pathComparer = OperatingSystem.IsWindows()
@@ -126,8 +138,8 @@ public sealed class LibraryIndexer(
         var sourceDirectoryPaths = sourceDirectories
             .Select(directory => Path.GetFullPath(directory.Path))
             .ToHashSet(pathComparer);
-        var currentPdfPaths = pdfPaths
-            .Select(pdf => Path.GetFullPath(pdf.Path))
+        var currentDocumentPaths = documentPaths
+            .Select(document => Path.GetFullPath(document.Path))
             .ToHashSet(pathComparer);
 
         var removedFiles = 0;
@@ -137,7 +149,7 @@ public sealed class LibraryIndexer(
             var parentDirectory = Path.GetDirectoryName(fullIndexedPath);
             if (parentDirectory is not null
                 && sourceDirectoryPaths.Contains(parentDirectory)
-                && !currentPdfPaths.Contains(fullIndexedPath))
+                && !currentDocumentPaths.Contains(fullIndexedPath))
             {
                 await store.RemoveDocumentAsync(indexedPath, cancellationToken);
                 removedFiles++;
@@ -165,14 +177,14 @@ public sealed class LibraryIndexer(
         if (matches.Length == 0 || matches[0].Score < 0.15f)
         {
             return new AskResponse(
-                "I could not find a sufficiently relevant passage in the indexed PDFs to answer that.",
+                "I could not find a sufficiently relevant passage in the indexed library to answer that.",
                 []);
         }
 
         var context = string.Join(
             "\n\n",
             matches.Select(match =>
-                $"[{match.Chunk.SourceType} source: {match.Chunk.Source}, page {match.Chunk.PageNumber}]\n{match.Chunk.Content}"));
+                $"[{match.Chunk.SourceType} source: {match.Chunk.Source}, {GetLocationLabel(match.Chunk.Source)} {match.Chunk.PageNumber}]\n{match.Chunk.Content}"));
         var answer = await ollama.AnswerAsync(context, question, cancellationToken);
         var sources = matches
             .Select(match => new SourceCitation(match.Chunk.Source, match.Chunk.PageNumber, match.Chunk.SourceType))
@@ -217,6 +229,13 @@ public sealed class LibraryIndexer(
 
     private static List<IndexedChunk> ReadChunks(string path, string sourceType)
     {
+        return Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase)
+            ? ReadPdfChunks(path, sourceType)
+            : ReadTextChunks(path, sourceType);
+    }
+
+    private static List<IndexedChunk> ReadPdfChunks(string path, string sourceType)
+    {
         var chunks = new List<IndexedChunk>();
         using var document = PdfDocument.Open(path);
         var source = Path.GetFileName(path);
@@ -235,6 +254,38 @@ public sealed class LibraryIndexer(
 
         return chunks;
     }
+
+    private static List<IndexedChunk> ReadTextChunks(string path, string sourceType)
+    {
+        var text = File.ReadAllText(path);
+        if (Path.GetExtension(path).Equals(".html", StringComparison.OrdinalIgnoreCase)
+            || Path.GetExtension(path).Equals(".htm", StringComparison.OrdinalIgnoreCase))
+        {
+            text = Regex.Replace(text, @"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ");
+            text = Regex.Replace(text, @"(?s)<!--.*?-->", " ");
+            text = Regex.Replace(text, @"<[^>]*>", " ");
+            text = WebUtility.HtmlDecode(text);
+        }
+
+        text = Regex.Replace(text, @"\s+", " ").Trim();
+        var source = Path.GetFileName(path);
+        var chunks = new List<IndexedChunk>();
+        var section = 1;
+        foreach (var content in SplitIntoChunks(text))
+        {
+            var identifier = $"{Path.GetFullPath(path)}|{section}";
+            var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identifier)));
+            chunks.Add(new IndexedChunk(id, source, section++, content, [], sourceType));
+        }
+
+        return chunks;
+    }
+
+    private static bool IsSupportedFile(string path) =>
+        SupportedExtensions.Contains(Path.GetExtension(path));
+
+    private static string GetLocationLabel(string source) =>
+        Path.GetExtension(source).Equals(".pdf", StringComparison.OrdinalIgnoreCase) ? "page" : "section";
 
     private static IEnumerable<string> SplitIntoChunks(string text)
     {

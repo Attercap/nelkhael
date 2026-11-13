@@ -52,7 +52,7 @@
       <div class="toolbar">
         <div id="status" role="status">Checking library…</div>
         <div class="toolbar-actions">
-          <button id="index" type="button">Index PDF library</button>
+          <button id="index" type="button">Index library</button>
           <button id="flush-index" class="danger" type="button">Flush Index</button>
         </div>
       </div>
@@ -65,7 +65,7 @@
       <div id="answer" aria-live="polite"></div>
       <ul id="sources" aria-label="Sources"></ul>
     </section>
-    <p class="footnote">Nelkhael runs against a local Ollama instance and stores its index in a local SQLite database. Answers are paraphrases; consult the cited book pages for the full rules text. Scanned PDFs need OCR before indexing.</p>
+    <p class="footnote">Nelkhael runs against a local Ollama instance and stores its index in a local SQLite database. Answers are paraphrases; consult the cited files for full context. PDF scans need OCR before indexing; text, HTML, JSON, and PHP files are read as text.</p>
   </main>
   <script>
     const statusElement = document.querySelector("#status");
@@ -81,8 +81,8 @@
         const response = await fetch("/api/status");
         const status = await response.json();
         statusElement.textContent = status.directoryExists
-          ? `Official: ${status.officialDocuments} books · Unofficial: ${status.unofficialDocuments} books · ${status.chunks} passages`
-          : "Official/Unofficial PDF directories not found; update LibraryPath in appsettings.json.";
+          ? `Official: ${status.officialDocuments} files · Unofficial: ${status.unofficialDocuments} files · ${status.chunks} passages`
+          : "Official/Unofficial library directories not found; update LibraryPath in appsettings.json.";
       } catch {
         statusElement.textContent = "Could not read library status.";
       }
@@ -91,14 +91,14 @@
     indexButton.addEventListener("click", async () => {
       indexButton.disabled = true;
       flushIndexButton.disabled = true;
-      noticeElement.textContent = "Indexing PDFs; first-time indexing may take a while…";
+      noticeElement.textContent = "Indexing library files; first-time indexing may take a while…";
       try {
         const response = await fetch("/api/index", { method: "POST" });
         const result = await response.json();
         if (!response.ok && !result.isRunning) throw new Error(result.error ?? "Indexing failed.");
         noticeElement.textContent = result.isRunning
           ? "Indexing is already in progress."
-          : `Indexed ${result.indexedFiles} books; skipped ${result.skippedFiles} unchanged books; removed ${result.removedFiles} missing books from the index.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
+          : `Indexed ${result.indexedFiles} files; skipped ${result.skippedFiles} unchanged files; removed ${result.removedFiles} missing files from the index.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
         await refreshStatus();
       } catch (error) {
         noticeElement.textContent = error.message;
@@ -109,13 +109,13 @@
     });
 
     flushIndexButton.addEventListener("click", async () => {
-      if (!window.confirm("Are you sure you want to flush the index? All indexed passages will be removed; your PDF files will not be deleted.")) {
+      if (!window.confirm("Are you sure you want to flush the index? All indexed passages will be removed; your library files will not be deleted.")) {
         return;
       }
 
       indexButton.disabled = true;
       flushIndexButton.disabled = true;
-      noticeElement.textContent = "Flushing the PDF index…";
+      noticeElement.textContent = "Flushing the library index…";
       try {
         const response = await fetch("/api/index", { method: "DELETE" });
         if (response.status === 409) {
@@ -124,7 +124,7 @@
         if (!response.ok) throw new Error("Flushing the index failed.");
         answerElement.textContent = "";
         sourcesElement.replaceChildren();
-        noticeElement.textContent = "Index flushed. Your PDF files were not deleted.";
+        noticeElement.textContent = "Index flushed. Your library files were not deleted.";
         await refreshStatus();
       } catch (error) {
         noticeElement.textContent = error.message;
@@ -151,7 +151,10 @@
         answerElement.textContent = result.answer;
         for (const source of result.sources) {
           const item = document.createElement("li");
-          item.textContent = `${source.sourceType}: ${source.book}, PDF p. ${source.page}`;
+          const location = source.book.toLowerCase().endsWith(".pdf")
+            ? `PDF p. ${source.page}`
+            : `section ${source.page}`;
+          item.textContent = `${source.sourceType}: ${source.book}, ${location}`;
           sourcesElement.append(item);
         }
         noticeElement.textContent = "";
