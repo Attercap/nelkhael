@@ -42,11 +42,33 @@ public sealed class PdfLibraryStore
                 PageNumber INTEGER NOT NULL,
                 Content TEXT NOT NULL,
                 Embedding BLOB NOT NULL,
+                SourceUrl TEXT NULL,
                 FOREIGN KEY (DocumentPath) REFERENCES Documents(Path) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS IX_Chunks_DocumentPath ON Chunks(DocumentPath);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
+
+        await using var columnsCommand = connection.CreateCommand();
+        columnsCommand.CommandText = "PRAGMA table_info(Chunks);";
+        await using var columns = await columnsCommand.ExecuteReaderAsync(cancellationToken);
+        var hasSourceUrl = false;
+        while (await columns.ReadAsync(cancellationToken))
+        {
+            if (columns.GetString(1).Equals("SourceUrl", StringComparison.OrdinalIgnoreCase))
+            {
+                hasSourceUrl = true;
+                break;
+            }
+        }
+
+        await columns.CloseAsync();
+        if (!hasSourceUrl)
+        {
+            await using var alterCommand = connection.CreateCommand();
+            alterCommand.CommandText = "ALTER TABLE Chunks ADD COLUMN SourceUrl TEXT NULL;";
+            await alterCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
     }
 
     public async Task<bool> IsCurrentAsync(
@@ -125,8 +147,8 @@ public sealed class PdfLibraryStore
         {
             insert.Transaction = transaction;
             insert.CommandText = """
-                INSERT INTO Chunks (Id, DocumentPath, Source, PageNumber, Content, Embedding)
-                VALUES ($id, $path, $source, $page, $content, $embedding);
+                INSERT INTO Chunks (Id, DocumentPath, Source, PageNumber, Content, Embedding, SourceUrl)
+                VALUES ($id, $path, $source, $page, $content, $embedding, $sourceUrl);
                 """;
             var idParameter = insert.Parameters.Add("$id", SqliteType.Text);
             var pathParameter = insert.Parameters.Add("$path", SqliteType.Text);
@@ -134,6 +156,7 @@ public sealed class PdfLibraryStore
             var pageParameter = insert.Parameters.Add("$page", SqliteType.Integer);
             var contentParameter = insert.Parameters.Add("$content", SqliteType.Text);
             var embeddingParameter = insert.Parameters.Add("$embedding", SqliteType.Blob);
+            var sourceUrlParameter = insert.Parameters.Add("$sourceUrl", SqliteType.Text);
 
             foreach (var chunk in chunks)
             {
@@ -143,6 +166,7 @@ public sealed class PdfLibraryStore
                 pageParameter.Value = chunk.PageNumber;
                 contentParameter.Value = chunk.Content;
                 embeddingParameter.Value = ToBytes(chunk.Embedding);
+                sourceUrlParameter.Value = chunk.SourceUrl is null ? DBNull.Value : chunk.SourceUrl;
                 await insert.ExecuteNonQueryAsync(cancellationToken);
             }
         }
@@ -190,7 +214,7 @@ public sealed class PdfLibraryStore
         var chunks = new List<IndexedChunk>();
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT Id, DocumentPath, Source, PageNumber, Content, Embedding FROM Chunks;";
+        command.CommandText = "SELECT Id, DocumentPath, Source, PageNumber, Content, Embedding, SourceUrl FROM Chunks;";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
@@ -201,7 +225,8 @@ public sealed class PdfLibraryStore
                 reader.GetInt32(3),
                 reader.GetString(4),
                 FromBytes((byte[])reader[5]),
-                GetSourceType(reader.GetString(1))));
+                GetSourceType(reader.GetString(1)),
+                reader.IsDBNull(6) ? null : reader.GetString(6)));
         }
 
         return chunks;
@@ -264,7 +289,10 @@ public sealed class PdfLibraryStore
     }
 
     private static string GetSourceType(string documentPath) =>
-        string.Equals(
+        Uri.TryCreate(documentPath, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            ? "Unofficial"
+            : string.Equals(
             Path.GetFileName(Path.GetDirectoryName(documentPath)),
             "Unofficial",
             StringComparison.OrdinalIgnoreCase)
@@ -278,4 +306,5 @@ public sealed record IndexedChunk(
     int PageNumber,
     string Content,
     float[] Embedding,
-    string SourceType);
+    string SourceType,
+    string? SourceUrl = null);

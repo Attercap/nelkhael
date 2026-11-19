@@ -4,6 +4,8 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.WebHost.ConfigureKestrel(options => options.ListenLocalhost(5080));
 builder.Services.AddHttpClient<OllamaClient>(client => client.Timeout = TimeSpan.FromMinutes(5));
+builder.Services.AddHttpClient<PublicWebPageClient>(client => client.Timeout = TimeSpan.FromSeconds(30))
+    .ConfigurePrimaryHttpMessageHandler(PublicWebPageClient.CreateHandler);
 builder.Services.AddSingleton<PdfLibraryStore>();
 builder.Services.AddSingleton<LibraryIndexer>();
 

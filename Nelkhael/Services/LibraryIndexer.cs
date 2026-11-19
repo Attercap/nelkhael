@@ -1,6 +1,7 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
 
@@ -11,6 +12,7 @@ public sealed class LibraryIndexer(
     IWebHostEnvironment environment,
     PdfLibraryStore store,
     OllamaClient ollama,
+    PublicWebPageClient webPages,
     ILogger<LibraryIndexer> logger)
 {
     private const int ChunkSize = 1200;
@@ -20,6 +22,7 @@ public sealed class LibraryIndexer(
     private static readonly string[] SourceTypes = ["Official", "Unofficial"];
     private static readonly HashSet<string> SupportedExtensions =
         new([".pdf", ".txt", ".html", ".htm", ".json", ".php"], StringComparer.OrdinalIgnoreCase);
+    private static readonly JsonSerializerOptions WebSourceJsonOptions = new(JsonSerializerDefaults.Web);
     private readonly SemaphoreSlim _indexLock = new(1, 1);
     private readonly string _libraryPath = ResolveLibraryPath(configuration, environment);
 
@@ -50,17 +53,72 @@ public sealed class LibraryIndexer(
             var documentPaths = sourceDirectories
                 .SelectMany(directory => Directory.GetFiles(directory.Path, "*", SearchOption.TopDirectoryOnly)
                     .Where(IsSupportedFile)
+                    .Where(path => !directory.SourceType.Equals("Unofficial", StringComparison.OrdinalIgnoreCase)
+                        || !Path.GetFileName(path).Equals("links.json", StringComparison.OrdinalIgnoreCase))
                     .Select(path => (Path: path, directory.SourceType)))
                 .ToArray();
+
+            var failures = new List<string>();
+            var webSources = new List<WebSource>();
+            var webManifestValid = true;
+            var webManifestPath = Path.Combine(_libraryPath, "Unofficial", "links.json");
+            if (File.Exists(webManifestPath))
+            {
+                try
+                {
+                    var manifest = await File.ReadAllTextAsync(webManifestPath, cancellationToken);
+                    var entries = JsonSerializer.Deserialize<WebSource?[]>(manifest, WebSourceJsonOptions)
+                        ?? throw new InvalidDataException("The links manifest must contain a JSON array.");
+                    for (var index = 0; index < entries.Length; index++)
+                    {
+                        var entry = entries[index];
+                        if (entry is null)
+                        {
+                            webManifestValid = false;
+                            failures.Add($"links.json entry {index + 1}: entry must be an object.");
+                            continue;
+                        }
+
+                        if (!entry.Enabled)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            var topic = NormalizeWebSourceLabel(entry.Topic, "topic");
+                            var title = NormalizeWebSourceLabel(entry.Title, "title");
+                            var url = PublicWebPageClient.NormalizeUrl(entry.Url);
+                            webSources.Add(entry with { Topic = topic, Title = title, Url = url });
+                        }
+                        catch (InvalidDataException exception)
+                        {
+                            webManifestValid = false;
+                            failures.Add($"links.json entry {index + 1}: {exception.Message}");
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+                {
+                    webManifestValid = false;
+                    logger.LogError(exception, "Could not read web links manifest {ManifestPath}", webManifestPath);
+                    failures.Add($"links.json: {exception.Message}");
+                }
+            }
+
             var removedFiles = await RemoveMissingDocumentsAsync(sourceDirectories, documentPaths, cancellationToken);
+            if (webManifestValid)
+            {
+                removedFiles += await RemoveMissingWebDocumentsAsync(webSources, cancellationToken);
+            }
 
             var ollamaIssue = await ollama.GetEmbeddingModelIssueAsync(cancellationToken);
             if (ollamaIssue is not null)
             {
-                return new IndexResult(false, 0, 0, removedFiles, [ollamaIssue]);
+                failures.Add(ollamaIssue);
+                return new IndexResult(false, 0, 0, removedFiles, failures);
             }
 
-            var failures = new List<string>();
             var indexedFiles = 0;
             var skippedFiles = 0;
 
@@ -119,6 +177,58 @@ public sealed class LibraryIndexer(
                 }
             }
 
+            var indexedUrls = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var source in webSources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!indexedUrls.Add(source.Url))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var html = await webPages.FetchHtmlAsync(source.Url, cancellationToken);
+                    var fingerprint = Encoding.UTF8.GetBytes($"{source.Topic}\n{source.Title}\n{html}");
+                    var lastWriteUtcTicks = BitConverter.ToInt64(SHA256.HashData(fingerprint), 0);
+                    var fileLength = Encoding.UTF8.GetByteCount(html);
+                    if (await store.IsCurrentAsync(source.Url, lastWriteUtcTicks, fileLength, cancellationToken))
+                    {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    var chunks = ReadWebPageChunks(html, source);
+                    if (chunks.Count == 0)
+                    {
+                        throw new InvalidDataException("No searchable text was found.");
+                    }
+
+                    for (var offset = 0; offset < chunks.Count; offset += EmbeddingBatchSize)
+                    {
+                        var batch = chunks.Skip(offset).Take(EmbeddingBatchSize).ToArray();
+                        var embeddings = await ollama.EmbedAsync(batch.Select(chunk => chunk.Content).ToArray(), cancellationToken);
+                        for (var index = 0; index < batch.Length; index++)
+                        {
+                            chunks[offset + index] = chunks[offset + index] with { Embedding = embeddings[index] };
+                        }
+                    }
+
+                    await store.ReplaceDocumentAsync(
+                        source.Url,
+                        lastWriteUtcTicks,
+                        fileLength,
+                        chunks,
+                        cancellationToken);
+                    indexedFiles++;
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    logger.LogError(exception, "Could not index web page {PageUrl}", source.Url);
+                    failures.Add($"{source.Title} ({source.Url}): {exception.Message}");
+                }
+            }
+
             return new IndexResult(false, indexedFiles, skippedFiles, removedFiles, failures);
         }
         finally
@@ -159,6 +269,28 @@ public sealed class LibraryIndexer(
         return removedFiles;
     }
 
+    private async Task<int> RemoveMissingWebDocumentsAsync(
+        IReadOnlyCollection<WebSource> webSources,
+        CancellationToken cancellationToken)
+    {
+        var currentUrls = webSources
+            .Select(source => source.Url)
+            .ToHashSet(StringComparer.Ordinal);
+        var removedPages = 0;
+        foreach (var indexedPath in await store.GetDocumentPathsAsync(cancellationToken))
+        {
+            if (Uri.TryCreate(indexedPath, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+                && !currentUrls.Contains(indexedPath))
+            {
+                await store.RemoveDocumentAsync(indexedPath, cancellationToken);
+                removedPages++;
+            }
+        }
+
+        return removedPages;
+    }
+
     public async Task<AskResponse?> AnswerAsync(string question, CancellationToken cancellationToken)
     {
         var chunks = await store.GetChunksAsync(cancellationToken);
@@ -184,10 +316,14 @@ public sealed class LibraryIndexer(
         var context = string.Join(
             "\n\n",
             matches.Select(match =>
-                $"[{match.Chunk.SourceType} source: {match.Chunk.Source}, {GetLocationLabel(match.Chunk.Source)} {match.Chunk.PageNumber}]\n{match.Chunk.Content}"));
+                $"[{match.Chunk.SourceType} source: {match.Chunk.Source}, {GetLocationLabel(match.Chunk)} {match.Chunk.PageNumber}{(match.Chunk.SourceUrl is null ? "" : $", URL {match.Chunk.SourceUrl}")}]\n{match.Chunk.Content}"));
         var answer = await ollama.AnswerAsync(context, question, cancellationToken);
         var sources = matches
-            .Select(match => new SourceCitation(match.Chunk.Source, match.Chunk.PageNumber, match.Chunk.SourceType))
+            .Select(match => new SourceCitation(
+                match.Chunk.Source,
+                match.Chunk.PageNumber,
+                match.Chunk.SourceType,
+                match.Chunk.SourceUrl))
             .Distinct()
             .ToArray();
 
@@ -261,21 +397,41 @@ public sealed class LibraryIndexer(
         if (Path.GetExtension(path).Equals(".html", StringComparison.OrdinalIgnoreCase)
             || Path.GetExtension(path).Equals(".htm", StringComparison.OrdinalIgnoreCase))
         {
-            text = Regex.Replace(text, @"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ");
-            text = Regex.Replace(text, @"(?s)<!--.*?-->", " ");
-            text = Regex.Replace(text, @"<[^>]*>", " ");
-            text = WebUtility.HtmlDecode(text);
+            text = ExtractHtmlText(text);
         }
 
+        return CreateTextChunks(text, sourceType, Path.GetFileName(path), Path.GetFullPath(path));
+    }
+
+    private static List<IndexedChunk> ReadWebPageChunks(string html, WebSource source)
+    {
+        var text = $"{source.Topic}. {source.Title}. {ExtractHtmlText(html)}";
+        return CreateTextChunks(text, "Unofficial", source.Title, source.Url, source.Url);
+    }
+
+    private static string ExtractHtmlText(string html)
+    {
+        var text = Regex.Replace(html, @"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ");
+        text = Regex.Replace(text, @"(?s)<!--.*?-->", " ");
+        text = Regex.Replace(text, @"<[^>]*>", " ");
+        return WebUtility.HtmlDecode(text);
+    }
+
+    private static List<IndexedChunk> CreateTextChunks(
+        string text,
+        string sourceType,
+        string source,
+        string identifier,
+        string? sourceUrl = null)
+    {
         text = Regex.Replace(text, @"\s+", " ").Trim();
-        var source = Path.GetFileName(path);
         var chunks = new List<IndexedChunk>();
         var section = 1;
         foreach (var content in SplitIntoChunks(text))
         {
-            var identifier = $"{Path.GetFullPath(path)}|{section}";
-            var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identifier)));
-            chunks.Add(new IndexedChunk(id, source, section++, content, [], sourceType));
+            var chunkIdentifier = $"{identifier}|{section}";
+            var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(chunkIdentifier)));
+            chunks.Add(new IndexedChunk(id, source, section++, content, [], sourceType, sourceUrl));
         }
 
         return chunks;
@@ -284,8 +440,18 @@ public sealed class LibraryIndexer(
     private static bool IsSupportedFile(string path) =>
         SupportedExtensions.Contains(Path.GetExtension(path));
 
-    private static string GetLocationLabel(string source) =>
-        Path.GetExtension(source).Equals(".pdf", StringComparison.OrdinalIgnoreCase) ? "page" : "section";
+    private static string GetLocationLabel(IndexedChunk chunk) =>
+        chunk.SourceUrl is null && Path.GetExtension(chunk.Source).Equals(".pdf", StringComparison.OrdinalIgnoreCase)
+            ? "page"
+            : "section";
+
+    private static string NormalizeWebSourceLabel(string value, string label)
+    {
+        var normalized = Regex.Replace(value ?? "", @"\s+", " ").Trim();
+        return normalized.Length == 0
+            ? throw new InvalidDataException($"Web source {label} must not be empty.")
+            : normalized;
+    }
 
     private static IEnumerable<string> SplitIntoChunks(string text)
     {
@@ -366,5 +532,12 @@ public sealed record LibraryStatus(
     int Chunks,
     int OfficialDocuments,
     int UnofficialDocuments);
-public sealed record SourceCitation(string Book, int Page, string SourceType);
+public sealed record SourceCitation(string Book, int Page, string SourceType, string? Url = null);
 public sealed record AskResponse(string Answer, IReadOnlyList<SourceCitation> Sources);
+public sealed record WebSource
+{
+    public required string Topic { get; init; }
+    public required string Url { get; init; }
+    public required string Title { get; init; }
+    public required bool Enabled { get; init; }
+}

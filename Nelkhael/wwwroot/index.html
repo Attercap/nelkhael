@@ -46,7 +46,7 @@
     <header>
       <div class="eyebrow">Angel of Learning</div>
       <h1>Nelkhael</h1>
-      <div class="subtitle">A private, local rules companion for In Nomine. Ask a question and get a concise answer grounded in your indexed official and unofficial books.</div>
+      <div class="subtitle">A private, local rules companion for In Nomine. Ask a question and get a concise answer grounded in your indexed official and unofficial books, and public web pages.</div>
     </header>
     <section class="panel" aria-label="Rules reference">
       <div class="toolbar">
@@ -65,7 +65,7 @@
       <div id="answer" aria-live="polite"></div>
       <ul id="sources" aria-label="Sources"></ul>
     </section>
-    <p class="footnote">Nelkhael runs against a local Ollama instance and stores its index in a local SQLite database. Answers are paraphrases; consult the cited files for full context. PDF scans need OCR before indexing; text, HTML, JSON, and PHP files are read as text.</p>
+    <p class="footnote">Nelkhael runs against a local Ollama instance and stores its index in a local SQLite database. Answers are paraphrases; consult cited files and web pages for full context. PDF scans need OCR before indexing; text, HTML, JSON, and PHP files are read as text.</p>
   </main>
   <script>
     const statusElement = document.querySelector("#status");
@@ -81,7 +81,7 @@
         const response = await fetch("/api/status");
         const status = await response.json();
         statusElement.textContent = status.directoryExists
-          ? `Official: ${status.officialDocuments} files · Unofficial: ${status.unofficialDocuments} files · ${status.chunks} passages`
+          ? `Official: ${status.officialDocuments} documents · Unofficial: ${status.unofficialDocuments} documents · ${status.chunks} passages`
           : "Official/Unofficial library directories not found; update LibraryPath in appsettings.json.";
       } catch {
         statusElement.textContent = "Could not read library status.";
@@ -91,14 +91,14 @@
     indexButton.addEventListener("click", async () => {
       indexButton.disabled = true;
       flushIndexButton.disabled = true;
-      noticeElement.textContent = "Indexing library files; first-time indexing may take a while…";
+      noticeElement.textContent = "Indexing library files and web pages; first-time indexing may take a while…";
       try {
         const response = await fetch("/api/index", { method: "POST" });
         const result = await response.json();
         if (!response.ok && !result.isRunning) throw new Error(result.error ?? "Indexing failed.");
         noticeElement.textContent = result.isRunning
           ? "Indexing is already in progress."
-          : `Indexed ${result.indexedFiles} files; skipped ${result.skippedFiles} unchanged files; removed ${result.removedFiles} missing files from the index.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
+          : `Indexed ${result.indexedFiles} documents and pages; skipped ${result.skippedFiles} unchanged items; removed ${result.removedFiles} missing items from the index.${result.failures.length ? ` Issues: ${result.failures.join(" | ")}` : ""}`;
         await refreshStatus();
       } catch (error) {
         noticeElement.textContent = error.message;
@@ -151,10 +151,24 @@
         answerElement.textContent = result.answer;
         for (const source of result.sources) {
           const item = document.createElement("li");
-          const location = source.book.toLowerCase().endsWith(".pdf")
-            ? `PDF p. ${source.page}`
-            : `section ${source.page}`;
-          item.textContent = `${source.sourceType}: ${source.book}, ${location}`;
+          const location = source.url
+            ? `section ${source.page}`
+            : source.book.toLowerCase().endsWith(".pdf")
+              ? `PDF p. ${source.page}`
+              : `section ${source.page}`;
+          item.append(document.createTextNode(`${source.sourceType}: ${source.book}, ${location}`));
+          if (source.url) {
+            const url = new URL(source.url);
+            if (url.protocol === "http:" || url.protocol === "https:") {
+              item.append(document.createTextNode(" · "));
+              const link = document.createElement("a");
+              link.href = url.href;
+              link.textContent = source.url;
+              link.target = "_blank";
+              link.rel = "noopener noreferrer";
+              item.append(link);
+            }
+          }
           sourcesElement.append(item);
         }
         noticeElement.textContent = "";

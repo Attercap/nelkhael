@@ -18,7 +18,7 @@ public sealed class LibraryIndexerTests
     private string _libraryPath = "";
     private PdfLibraryStore _store = null!;
     private IConfiguration _configuration = null!;
-    private HttpClient? _httpClient;
+    private readonly List<HttpClient> _httpClients = [];
 
     [TestInitialize]
     public async Task InitializeAsync()
@@ -44,7 +44,11 @@ public sealed class LibraryIndexerTests
     [TestCleanup]
     public void Cleanup()
     {
-        _httpClient?.Dispose();
+        foreach (var httpClient in _httpClients)
+        {
+            httpClient.Dispose();
+        }
+
         SqliteConnection.ClearAllPools();
         if (Directory.Exists(_root))
         {
@@ -147,6 +151,173 @@ public sealed class LibraryIndexerTests
     }
 
     [TestMethod]
+    public async Task IndexAsync_FetchesManifestPagesAndReturnsTheirUrlsAsCitations()
+    {
+        const string pageUrl = "https://example.test/songs";
+        await File.WriteAllTextAsync(
+            Path.Combine(_libraryPath, "Unofficial", "links.json"),
+            $$"""
+            [
+              {
+                "topic": "Songs",
+                "url": "{{pageUrl}}",
+                "title": "Songs of Appraisal",
+                "enabled": true
+              }
+            ]
+            """);
+        var webHandler = new WebPageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                "<html><head><script>hidden script</script></head><body><p>Appraisal song text.</p></body></html>",
+                Encoding.UTF8,
+                "text/html")
+        });
+        var indexer = CreateIndexer(embeddingModelAvailable: true, webHandler);
+
+        var result = await indexer.IndexAsync(CancellationToken.None);
+
+        Assert.AreEqual(1, result.IndexedFiles);
+        Assert.IsEmpty(result.Failures);
+        Assert.AreEqual(1, webHandler.RequestCount);
+        var indexedPage = (await _store.GetChunksAsync(CancellationToken.None)).Single();
+        Assert.AreEqual("Unofficial", indexedPage.SourceType);
+        Assert.AreEqual("Songs of Appraisal", indexedPage.Source);
+        Assert.AreEqual(pageUrl, indexedPage.SourceUrl);
+        Assert.Contains("Songs", indexedPage.Content);
+        Assert.Contains("Appraisal song text.", indexedPage.Content);
+        Assert.DoesNotContain("hidden script", indexedPage.Content);
+
+        var answer = await indexer.AnswerAsync("How does the song work?", CancellationToken.None);
+        Assert.IsNotNull(answer);
+        Assert.AreEqual(pageUrl, answer.Sources.Single().Url);
+
+        await File.WriteAllTextAsync(Path.Combine(_libraryPath, "Unofficial", "links.json"), "[]");
+        var removalResult = await indexer.IndexAsync(CancellationToken.None);
+        Assert.AreEqual(1, removalResult.RemovedFiles);
+        Assert.IsEmpty(await _store.GetDocumentPathsAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public async Task IndexAsync_RejectsPrivateWebTargetsAndRedirects()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_libraryPath, "Unofficial", "links.json"),
+            """
+            [
+              {
+                "topic": "Local",
+                "url": "http://127.0.0.1/private",
+                "title": "Private page",
+                "enabled": true
+              }
+            ]
+            """);
+        var privateTargetHandler = new WebPageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var privateTargetResult = await CreateIndexer(true, privateTargetHandler).IndexAsync(CancellationToken.None);
+
+        Assert.AreEqual(0, privateTargetHandler.RequestCount);
+        Assert.HasCount(1, privateTargetResult.Failures);
+        Assert.Contains("non-public", privateTargetResult.Failures[0]);
+
+        await File.WriteAllTextAsync(
+            Path.Combine(_libraryPath, "Unofficial", "links.json"),
+            """
+            [
+              {
+                "topic": "Redirect",
+                "url": "https://example.test/start",
+                "title": "Redirect page",
+                "enabled": true
+              }
+            ]
+            """);
+        var redirectHandler = new WebPageHandler(_ => new HttpResponseMessage(HttpStatusCode.Redirect)
+        {
+            Headers = { Location = new Uri("http://127.0.0.1/private") }
+        });
+        var redirectResult = await CreateIndexer(true, redirectHandler).IndexAsync(CancellationToken.None);
+
+        Assert.AreEqual(1, redirectHandler.RequestCount);
+        Assert.HasCount(1, redirectResult.Failures);
+        Assert.Contains("non-public", redirectResult.Failures[0]);
+    }
+
+    [TestMethod]
+    public async Task IndexAsync_ReportsForbiddenPagesAndIdentifiesItsRequests()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_libraryPath, "Unofficial", "links.json"),
+            """
+            [
+              {
+                "topic": "Reference",
+                "url": "https://example.test/forbidden",
+                "title": "Forbidden page",
+                "enabled": true
+              }
+            ]
+            """);
+        var webHandler = new WebPageHandler(_ => new HttpResponseMessage(HttpStatusCode.Forbidden));
+
+        var result = await CreateIndexer(true, webHandler).IndexAsync(CancellationToken.None);
+
+        Assert.Contains("Nelkhael/1.0", webHandler.UserAgent ?? string.Empty);
+        Assert.HasCount(1, result.Failures);
+        Assert.Contains("will not bypass the restriction", result.Failures[0]);
+    }
+
+    [TestMethod]
+    public async Task InitializeAsync_AddsUrlCitationColumnToExistingDatabase()
+    {
+        var legacyDataPath = Path.Combine(_root, "legacy.db");
+        await using (var connection = new SqliteConnection(
+            new SqliteConnectionStringBuilder { DataSource = legacyDataPath }.ToString()))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE Documents (
+                    Path TEXT PRIMARY KEY,
+                    LastWriteUtcTicks INTEGER NOT NULL,
+                    FileLength INTEGER NOT NULL,
+                    ChunkCount INTEGER NOT NULL
+                );
+                CREATE TABLE Chunks (
+                    Id TEXT PRIMARY KEY,
+                    DocumentPath TEXT NOT NULL,
+                    Source TEXT NOT NULL,
+                    PageNumber INTEGER NOT NULL,
+                    Content TEXT NOT NULL,
+                    Embedding BLOB NOT NULL,
+                    FOREIGN KEY (DocumentPath) REFERENCES Documents(Path) ON DELETE CASCADE
+                );
+                CREATE INDEX IX_Chunks_DocumentPath ON Chunks(DocumentPath);
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var legacyConfiguration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["DataPath"] = legacyDataPath
+            })
+            .Build();
+        var legacyStore = new PdfLibraryStore(legacyConfiguration, CreateEnvironment());
+        await legacyStore.InitializeAsync();
+        await legacyStore.ReplaceDocumentAsync(
+            "https://example.test/reference",
+            1,
+            1,
+            [new IndexedChunk("web-chunk", "Reference", 1, "indexed web text", [0.1f], "Unofficial", "https://example.test/reference")],
+            CancellationToken.None);
+
+        var storedChunk = (await legacyStore.GetChunksAsync(CancellationToken.None)).Single();
+        Assert.AreEqual("https://example.test/reference", storedChunk.SourceUrl);
+        Assert.AreEqual("Unofficial", storedChunk.SourceType);
+    }
+
+    [TestMethod]
     public async Task FlushIndexAsync_RemovesAllIndexedDocumentsAndChunksWithoutDeletingPdfs()
     {
         var pdfPath = Path.Combine(_libraryPath, "Official", "book.pdf");
@@ -187,15 +358,23 @@ public sealed class LibraryIndexerTests
             CancellationToken.None);
     }
 
-    private LibraryIndexer CreateIndexer(bool embeddingModelAvailable)
+    private LibraryIndexer CreateIndexer(
+        bool embeddingModelAvailable,
+        HttpMessageHandler? webHandler = null)
     {
-        _httpClient = new HttpClient(new OllamaHandler(embeddingModelAvailable));
-        var ollama = new OllamaClient(_httpClient, _configuration);
+        var ollamaHttpClient = new HttpClient(new OllamaHandler(embeddingModelAvailable));
+        var webHttpClient = new HttpClient(webHandler ?? new WebPageHandler(
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound)));
+        _httpClients.Add(ollamaHttpClient);
+        _httpClients.Add(webHttpClient);
+        var ollama = new OllamaClient(ollamaHttpClient, _configuration);
+        var webPages = new PublicWebPageClient(webHttpClient);
         return new LibraryIndexer(
             _configuration,
             CreateEnvironment(),
             _store,
             ollama,
+            webPages,
             NullLogger<LibraryIndexer>.Instance);
     }
 
@@ -242,7 +421,33 @@ public sealed class LibraryIndexerTests
                 };
             }
 
+            if (request.RequestUri?.AbsolutePath == "/api/chat")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        message = new { role = "assistant", content = "A concise answer." }
+                    })
+                };
+            }
+
             return new HttpResponseMessage(HttpStatusCode.NotFound);
+        }
+    }
+
+    private sealed class WebPageHandler(Func<HttpRequestMessage, HttpResponseMessage> createResponse) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+        public string? UserAgent { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            UserAgent = request.Headers.UserAgent.ToString();
+            return Task.FromResult(createResponse(request));
         }
     }
 }
